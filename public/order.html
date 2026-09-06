@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1.0">
+  <title>Статус заказа — Keywave</title>
+  <link rel="stylesheet" href="/assets/styles.css">
+  <link rel="stylesheet" href="/assets/status.css">
+</head>
+<body class="status-body">
+  <header class="status-header"><div class="status-header-inner"><a class="brand" href="/">key<span>wave</span></a><a class="help-link" href="/">Вернуться на витрину</a></div></header>
+  <main class="status-wrap">
+    <p class="drawer-overline">Статус заказа</p><h1 id="statusTitle">Проверяем заказ…</h1>
+    <section class="status-card" aria-live="polite"><div class="status-pulse" id="statusPulse"></div><div class="status-copy"><p id="statusText">Загружаем данные.</p><strong id="orderCode"></strong></div></section>
+    <div class="status-meta" id="statusMeta" hidden></div>
+    <div class="status-actions" id="statusActions" hidden><button class="button" id="paySuccess">Эмулировать успешную оплату</button><button class="button" id="payFail">Эмулировать отказ</button></div>
+    <p class="form-message" id="statusMessage"></p>
+    <section class="status-flow" aria-label="Как проходит заказ"><p>Как проходит заказ</p><ol><li>Оплата подтверждается</li><li>Система запрашивает код</li><li>Код появляется на этой странице</li></ol></section>
+  </main>
+  <script src="/assets/order.js"></script>
+</body>
+</html>

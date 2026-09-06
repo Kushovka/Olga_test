@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1.0">
+  <title>Админка — Keywave</title>
+  <link rel="stylesheet" href="/assets/admin.css">
+</head>
+<body class="admin-body">
+  <header class="admin-header">
+    <div class="admin-header-inner">
+      <a class="brand" href="/">key<span>wave</span></a>
+      <a class="back-link" href="/">Вернуться на витрину</a>
+    </div>
+  </header>
+  <main class="admin-wrap">
+    <section class="admin-intro">
+      <h1>Восстановление заказов</h1>
+      <p>Управляйте поведением поставщиков, пополняйте пул ключей и безопасно повторяйте выдачу оплаченных заказов.</p>
+    </section>
+    <section class="admin-grid" aria-label="Настройки выдачи">
+      <section class="admin-card provider-settings">
+        <div class="card-heading"><h2>Поставщики выдачи</h2><p>Режимы позволяют воспроизвести ошибки и таймауты без изменения заказов.</p></div>
+        <div class="provider-grid">
+          <article class="provider-card"><div class="provider-card-title"><strong>Поставщик A</strong><span>Основной</span></div><label>Режим<select id="providerA"><option value="success">Успешная выдача</option><option value="error">Ошибка поставщика</option><option value="timeout_after_issue">Таймаут после выдачи</option><option value="out_of_stock">Нет ключей</option></select></label><div class="rate-grid"><label>Ошибка, %<input id="providerAError" type="number" min="0" max="100" value="0"></label><label>Таймаут, %<input id="providerATimeout" type="number" min="0" max="100" value="0"></label><label>Задержка, мс<input id="providerADelay" type="number" min="0" max="10000" value="0"></label></div></article>
+          <article class="provider-card"><div class="provider-card-title"><strong>Поставщик B</strong><span>Резервный</span></div><label>Режим<select id="providerB"><option value="success">Успешная выдача</option><option value="error">Ошибка поставщика</option><option value="timeout_after_issue">Таймаут после выдачи</option><option value="out_of_stock">Нет ключей</option></select></label><div class="rate-grid"><label>Ошибка, %<input id="providerBError" type="number" min="0" max="100" value="0"></label><label>Таймаут, %<input id="providerBTimeout" type="number" min="0" max="100" value="0"></label><label>Задержка, мс<input id="providerBDelay" type="number" min="0" max="10000" value="0"></label></div></article>
+        </div>
+        <div class="card-actions"><button class="primary-button" id="saveProviders">Сохранить настройки</button><p id="providerMessage" class="form-message" aria-live="polite"></p></div>
+      </section>
+      <aside class="admin-card inventory-card">
+        <div class="card-heading"><h2>Пополнение пула</h2><p>Добавьте новые ключи для восстановления заказов.</p></div>
+        <label>Товар<select id="inventorySku"></select></label>
+        <label>Количество<input id="inventoryCount" type="number" min="1" max="100" value="1"></label>
+        <button class="primary-button full-button" id="restock">Пополнить пул</button><p id="inventoryMessage" class="form-message" aria-live="polite"></p>
+      </aside>
+    </section>
+    <section class="admin-card recovery-card">
+      <div class="card-heading recovery-heading"><div><h2>Оплачены, но не выданы</h2><p>Повтор безопасен: финальная выдача не изменяется, а таймаутный запрос использует прежний идентификатор.</p></div><span class="recovery-count" id="recoveryCount">0 заказов</span></div>
+      <div id="recoveryList" class="recovery-list" aria-live="polite"></div>
+    </section>
+  </main>
+  <script src="/assets/admin.js"></script>
+</body>
+</html>
