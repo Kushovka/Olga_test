@@ -1,17 +1,19 @@
 import asyncio
+import contextlib
+import json
 import os
 import random
 import secrets
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Literal
+from typing import AsyncIterator, Literal
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, select, text
+from sqlalchemy import DateTime, ForeignKey, Integer, String, UniqueConstraint, func, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -20,6 +22,8 @@ DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://game_store:game_s
 engine = create_async_engine(DATABASE_URL, pool_pre_ping=True)
 Session = async_sessionmaker(engine, expire_on_commit=False)
 ROOT = Path(__file__).resolve().parent.parent
+RESERVATION_SECONDS = max(30, int(os.getenv("RESERVATION_SECONDS", "180")))
+catalog_subscribers: set[asyncio.Queue[str]] = set()
 
 
 class Base(DeclarativeBase):
@@ -49,8 +53,10 @@ class Order(Base):
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     sku: Mapped[str] = mapped_column(ForeignKey("products.sku"))
     amount: Mapped[int] = mapped_column(Integer)
-    status: Mapped[str] = mapped_column(String(32), default="created", index=True)
+    status: Mapped[str] = mapped_column(String(32), default="reserved", index=True)
     promo_code: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    reserved_key_id: Mapped[int | None] = mapped_column(ForeignKey("inventory_keys.id"), nullable=True, unique=True)
+    reservation_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
@@ -139,6 +145,61 @@ async def seed() -> None:
                     await db.execute(insert(InventoryKey).values(sku=sku, code=f"{sku[:5]}-{n:04d}-{secrets.token_hex(3).upper()}"))
 
 
+async def release_expired_reservations(db: AsyncSession) -> bool:
+    """Return keys from elapsed checkout reservations under row locks."""
+    now = datetime.now(timezone.utc)
+    orders = (await db.scalars(
+        select(Order)
+        .where(Order.status == "reserved", Order.reservation_expires_at.is_not(None), Order.reservation_expires_at <= now)
+        .with_for_update(skip_locked=True)
+    )).all()
+    for order in orders:
+        if order.reserved_key_id:
+            key = await db.scalar(select(InventoryKey).where(InventoryKey.id == order.reserved_key_id).with_for_update())
+            if key and key.order_id == order.id and key.state == "reserved":
+                key.state, key.order_id = "available", None
+            order.reserved_key_id = None
+        order.status = "reservation_expired"
+    return bool(orders)
+
+
+async def release_expired_reservations_now() -> bool:
+    async with Session.begin() as db:
+        return await release_expired_reservations(db)
+
+
+async def catalog_snapshot() -> list[dict]:
+    async with Session() as db:
+        stock_rows = (await db.execute(
+            select(InventoryKey.sku, func.count(InventoryKey.id))
+            .where(InventoryKey.state == "available")
+            .group_by(InventoryKey.sku)
+        )).all()
+        available = {sku: count for sku, count in stock_rows}
+        rows = (await db.scalars(select(Product).order_by(Product.price))).all()
+        return [{"sku": p.sku, "name": p.name, "price": p.price, "kind": p.kind, "cover": p.cover,
+                 "available": available.get(p.sku, 0), "in_stock": available.get(p.sku, 0) > 0} for p in rows]
+
+
+async def publish_catalog() -> None:
+    if not catalog_subscribers:
+        return
+    payload = json.dumps(await catalog_snapshot(), ensure_ascii=False)
+    for queue in tuple(catalog_subscribers):
+        if queue.full():
+            with contextlib.suppress(asyncio.QueueEmpty):
+                queue.get_nowait()
+        with contextlib.suppress(asyncio.QueueFull):
+            queue.put_nowait(payload)
+
+
+async def reservation_reaper() -> None:
+    while True:
+        await asyncio.sleep(1)
+        if await release_expired_reservations_now():
+            await publish_catalog()
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     async with engine.begin() as conn:
@@ -146,9 +207,17 @@ async def lifespan(_: FastAPI):
         await conn.execute(text("ALTER TABLE provider_config ADD COLUMN IF NOT EXISTS error_rate INTEGER NOT NULL DEFAULT 0"))
         await conn.execute(text("ALTER TABLE provider_config ADD COLUMN IF NOT EXISTS timeout_rate INTEGER NOT NULL DEFAULT 0"))
         await conn.execute(text("ALTER TABLE provider_config ADD COLUMN IF NOT EXISTS delay_ms INTEGER NOT NULL DEFAULT 0"))
+        await conn.execute(text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS reserved_key_id INTEGER UNIQUE REFERENCES inventory_keys(id)"))
+        await conn.execute(text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS reservation_expires_at TIMESTAMPTZ"))
     await seed()
-    yield
-    await engine.dispose()
+    reaper = asyncio.create_task(reservation_reaper())
+    try:
+        yield
+    finally:
+        reaper.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await reaper
+        await engine.dispose()
 
 
 app = FastAPI(title="Game Market API", lifespan=lifespan)
@@ -176,8 +245,14 @@ class ProviderModeInput(BaseModel):
     delay_ms: int = Field(default=0, ge=0, le=10_000)
 
 
+class ProductUpdateInput(BaseModel):
+    price: int = Field(ge=0, le=1_000_000)
+
+
 async def apply_waiting_events(order_id: str) -> None:
+    changed_catalog = False
     async with Session.begin() as db:
+        await release_expired_reservations(db)
         order = await db.scalar(select(Order).where(Order.id == order_id).with_for_update())
         if not order:
             return
@@ -186,11 +261,19 @@ async def apply_waiting_events(order_id: str) -> None:
             # A successful-looking event with another amount/currency must never
             # grant a product. It is consumed for idempotency, while a later valid
             # event may still confirm the order.
-            if event.status == "paid" and event.amount == order.amount and event.currency == "RUB" and order.status not in {"delivered", "payment_failed"}:
+            if event.status == "paid" and event.amount == order.amount and event.currency == "RUB" and order.status == "reserved":
                 order.status = "paid"
-            elif event.status == "failed" and order.status not in {"delivered", "payment_failed"}:
+            elif event.status == "failed" and order.status == "reserved":
                 order.status = "payment_failed"
+                if order.reserved_key_id:
+                    key = await db.scalar(select(InventoryKey).where(InventoryKey.id == order.reserved_key_id).with_for_update())
+                    if key and key.order_id == order.id and key.state == "reserved":
+                        key.state, key.order_id = "available", None
+                        changed_catalog = True
+                    order.reserved_key_id = None
             event.applied_at = datetime.now(timezone.utc)
+    if changed_catalog:
+        await publish_catalog()
     await schedule_delivery(order_id)
 
 
@@ -220,7 +303,11 @@ async def supplier_issue(provider: str, order_id: str, sku: str, request_id: str
             db.add(SupplierRequest(request_id=request_id, provider=provider, order_id=order_id, sku=sku, outcome="out_of_stock"))
             result = ("out_of_stock", None, None)
         else:
-            key = await db.scalar(select(InventoryKey).where(InventoryKey.sku == sku, InventoryKey.state == "available").order_by(InventoryKey.id).with_for_update(skip_locked=True))
+            # Normal checkout already owns a reservation. A fallback allocation is
+            # kept only for old/recovery orders created before reservation support.
+            key = await db.scalar(select(InventoryKey).where(InventoryKey.order_id == order_id, InventoryKey.state == "reserved").with_for_update())
+            if not key:
+                key = await db.scalar(select(InventoryKey).where(InventoryKey.sku == sku, InventoryKey.state == "available").order_by(InventoryKey.id).with_for_update(skip_locked=True))
             if not key:
                 db.add(SupplierRequest(request_id=request_id, provider=provider, order_id=order_id, sku=sku, outcome="out_of_stock"))
                 result = ("out_of_stock", None, None)
@@ -281,6 +368,7 @@ async def deliver(order_id: str, sku: str) -> None:
                 if key:
                     key.state = "issued"
                 order.status = "delivered"
+        await publish_catalog()
         return
     await mark_recoverable(order_id, "out_of_stock" if outcome == "out_of_stock" else "delivery_failed")
 
@@ -298,7 +386,9 @@ async def view_order(db: AsyncSession, order_id: str) -> dict:
         raise HTTPException(404, "Заказ не найден")
     delivery = await db.scalar(select(Delivery).where(Delivery.order_id == order.id))
     product = await db.get(Product, order.sku)
-    return {"id": order.id, "status": order.status, "amount": order.amount, "product": product.name if product else order.sku, "code": delivery.code if delivery else None, "created_at": order.created_at}
+    return {"id": order.id, "sku": order.sku, "status": order.status, "amount": order.amount,
+            "product": product.name if product else order.sku, "code": delivery.code if delivery else None,
+            "created_at": order.created_at, "reservation_expires_at": order.reservation_expires_at}
 
 
 @app.get("/")
@@ -322,25 +412,53 @@ async def admin_route():
 
 
 @app.get("/api/products")
-async def products():
-    async with Session() as db:
-        rows = (await db.scalars(select(Product).order_by(Product.price))).all()
-        return [{"sku": p.sku, "name": p.name, "price": p.price, "kind": p.kind, "cover": p.cover} for p in rows]
+async def products(q: str = "", kind: str = ""):
+    if await release_expired_reservations_now():
+        await publish_catalog()
+    rows = await catalog_snapshot()
+    needle = q.strip().lower()
+    return [item for item in rows if (not needle or needle in item["name"].lower()) and (not kind or item["kind"] == kind)]
+
+
+@app.get("/api/events/catalog")
+async def catalog_events() -> StreamingResponse:
+    async def stream() -> AsyncIterator[str]:
+        queue: asyncio.Queue[str] = asyncio.Queue(maxsize=1)
+        catalog_subscribers.add(queue)
+        try:
+            yield f"event: catalog\ndata: {json.dumps(await catalog_snapshot(), ensure_ascii=False)}\n\n"
+            while True:
+                try:
+                    payload = await asyncio.wait_for(queue.get(), timeout=15)
+                    yield f"event: catalog\ndata: {payload}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+        finally:
+            catalog_subscribers.discard(queue)
+    return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @app.post("/api/orders")
 async def create_order(payload: OrderInput):
     order_id = payload.order_id or f"ord_{secrets.token_urlsafe(8)}"
+    created = False
     async with Session.begin() as db:
         # Serializes only calls with the same client idempotency key. The second
         # retry sees the existing order instead of racing a SELECT/INSERT pair.
         await db.execute(text("SELECT pg_advisory_xact_lock(hashtext(:order_id))"), {"order_id": order_id})
-        product = await db.get(Product, payload.sku)
+        await release_expired_reservations(db)
+        product = await db.scalar(select(Product).where(Product.sku == payload.sku).with_for_update())
         if not product:
             raise HTTPException(404, "Товар не найден")
         existing = await db.get(Order, order_id)
         if existing:
             return await view_order(db, order_id)
+        key = await db.scalar(
+            select(InventoryKey).where(InventoryKey.sku == product.sku, InventoryKey.state == "available")
+            .order_by(InventoryKey.id).with_for_update(skip_locked=True)
+        )
+        if not key:
+            raise HTTPException(409, "Товар только что раскупили. Выберите другой товар или вернитесь к витрине.")
         amount, promo = product.price, None
         if payload.promo_code:
             promo = await db.scalar(select(Promocode).where(Promocode.code == payload.promo_code.upper()).with_for_update())
@@ -349,8 +467,13 @@ async def create_order(payload: OrderInput):
             promo.used_count += 1
             amount = max(0, product.price - (product.price * promo.value // 100 if promo.discount_type == "percent" else promo.value))
             db.add(PromoUse(order_id=order_id, code=promo.code))
-        db.add(Order(id=order_id, sku=product.sku, amount=amount, promo_code=promo.code if promo else None))
+        key.state, key.order_id = "reserved", order_id
+        db.add(Order(id=order_id, sku=product.sku, amount=amount, status="reserved", promo_code=promo.code if promo else None,
+                     reserved_key_id=key.id, reservation_expires_at=datetime.now(timezone.utc) + timedelta(seconds=RESERVATION_SECONDS)))
+        created = True
     await apply_waiting_events(order_id)
+    if created:
+        await publish_catalog()
     async with Session() as db:
         return await view_order(db, order_id)
 
@@ -379,6 +502,8 @@ async def emulate_payment(order_id: str, request: Request):
 
 @app.get("/api/orders/{order_id}")
 async def get_order(order_id: str):
+    if await release_expired_reservations_now():
+        await publish_catalog()
     async with Session() as db:
         return await view_order(db, order_id)
 
@@ -406,7 +531,19 @@ async def add_inventory(sku: str, request: Request):
             raise HTTPException(404, "SKU не найден")
         for n in range(count):
             db.add(InventoryKey(sku=sku, code=f"{sku[:5]}-RESTOCK-{secrets.token_hex(4).upper()}"))
+    await publish_catalog()
     return {"added": count}
+
+
+@app.put("/api/admin/products/{sku}")
+async def update_product(sku: str, payload: ProductUpdateInput):
+    async with Session.begin() as db:
+        product = await db.scalar(select(Product).where(Product.sku == sku).with_for_update())
+        if not product:
+            raise HTTPException(404, "SKU не найден")
+        product.price = payload.price
+    await publish_catalog()
+    return {"sku": sku, "price": payload.price}
 
 
 @app.get("/api/admin/providers")

@@ -28,8 +28,10 @@
         <div class="card-actions"><button class="primary-button" id="saveProviders">Сохранить настройки</button><p id="providerMessage" class="form-message" aria-live="polite"></p></div>
       </section>
       <aside class="admin-card inventory-card">
-        <div class="card-heading"><h2>Пополнение пула</h2><p>Добавьте новые ключи для восстановления заказов.</p></div>
+        <div class="card-heading"><h2>Управление витриной</h2><p>Изменения цены и наличия мгновенно появятся у покупателей без перезагрузки.</p></div>
         <label>Товар<select id="inventorySku"></select></label>
+        <label>Цена, ₽<input id="productPrice" type="number" min="0" max="1000000" value="0"></label>
+        <button class="secondary-button full-button" id="savePrice">Сохранить цену</button>
         <label>Количество<input id="inventoryCount" type="number" min="1" max="100" value="1"></label>
         <button class="primary-button full-button" id="restock">Пополнить пул</button><p id="inventoryMessage" class="form-message" aria-live="polite"></p>
       </aside>
